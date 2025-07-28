@@ -23,9 +23,10 @@ use anyhow::{Result, anyhow};
 use bs58;
 use clap::Parser;
 use env_logger::Env;
-use image::RgbaImage;
+use image::{ImageBuffer, RgbaImage};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -72,7 +73,7 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
                     let mut buffer = [0; 8192]; 
                     if let Ok(n) = stream.read(&mut buffer).await {
                         let request_str = String::from_utf8_lossy(&buffer[..n]);
-                        let response = handle_rpc_request(&request_str, bc_clone, mempool_clone, job_pool_clone);
+                        let response = handle_rpc_request(&request_str, bc_clone, mempool_clone, job_pool_clone).await;
                         if let Err(e) = stream.write_all(response.as_bytes()).await {
                             log::error!("Failed to write RPC response: {}", e);
                         }
@@ -96,7 +97,7 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
         let miner_pub_key_hash = decoded_address[1..decoded_address.len() - 4].to_vec();
         
         let new_block_candidate = {
-            let bc = blockchain.lock().unwrap(); // Removed 'mut'
+            let bc = blockchain.lock().unwrap();
             let coinbase_tx = Transaction::new_coinbase_tx(&miner_pub_key_hash, format!("Block #{} reward", bc.height + 1));
             let mut transactions = vec![coinbase_tx];
             let mut mempool_guard = mempool.lock().unwrap();
@@ -155,7 +156,7 @@ fn create_unsigned_transaction(from: &str, to: &str, amount: u64, bc: &Blockchai
     Ok(tx)
 }
 
-fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempool_arc: Arc<Mutex<Mempool>>, job_pool_arc: Arc<Mutex<JobPool>>) -> String {
+async fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempool_arc: Arc<Mutex<Mempool>>, job_pool_arc: Arc<Mutex<JobPool>>) -> String {
     let parts: Vec<&str> = request.trim().split_whitespace().collect();
     match parts.as_slice() {
         ["get_balance", addr] => {
@@ -193,15 +194,28 @@ fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempool_arc
             } else { "ERR InvalidHex".to_string() }
         }
         ["submit_job", scene_file] => {
+            // PATH NORMALIZATION: Remove Windows verbatim prefix
+            let absolute_scene_file = match std::fs::canonicalize(scene_file) {
+                Ok(path) => {
+                    let p = path.to_string_lossy().into_owned();
+                    if p.starts_with(r"\\?\") {
+                        p[4..].to_string()  // Remove verbatim prefix
+                    } else {
+                        p
+                    }
+                }
+                Err(e) => return format!("ERR Cannot find scene file: {}", e),
+            };
+
             const TOTAL_TILES: u32 = 16; 
             let job_id = format!("job_{}", chrono::Utc::now().timestamp_micros());
-            log::info!("New render job received: {}. Queuing {} tiles...", &job_id, TOTAL_TILES);
+            log::info!("New render job received: {}. Queuing {} tiles for {}...", &job_id, TOTAL_TILES, &absolute_scene_file);
             let mut job_pool_guard = job_pool_arc.lock().unwrap();
             for i in 0..TOTAL_TILES {
                 let job = WorkUnit {
                     task_id: job_id.clone(),
                     tile_index: i,
-                    scene_file: scene_file.to_string(),
+                    scene_file: absolute_scene_file.clone(), // Store normalized path
                     render_settings: "{}".to_string(),
                 };
                 job_pool_guard.add_job(job);
@@ -317,30 +331,28 @@ async fn assemble_job(scene_file: String, output_path: String) -> Result<()> {
     log::info!("Scanning blockchain for completed tiles...");
     let mut current_hash = bc.tip.clone();
     loop {
-        let block_data = bc.db.get(current_hash)?.ok_or_else(|| anyhow!("Block not found"))?;
+        let block_data = bc.db.get(current_hash.clone())?.ok_or_else(|| anyhow!("Block not found"))?;
         let block: Block = bincode::deserialize(&block_data)?;
-
-        // Access prev_hash directly from Block struct
-        if block.prev_hash.is_empty() {
-            break;
-        }
-        current_hash = block.prev_hash;
 
         for cert in block.proofs {
             let result = cert.simulation_result.clone();
-            if result.scene_file == scene_file {
+            
+            // Compare by file name only, not full path
+            if Path::new(&result.scene_file).file_name() == Path::new(&scene_file).file_name() {
                 if !completed_tiles.contains_key(&result.tile_index) {
                     log::info!("Found proof for tile #{}. Verifying with nonce {}...", result.tile_index, result.nonce);
+                    log::debug!("On-chain scene path: {}", result.scene_file);
+                    log::debug!("User-provided scene path: {}", scene_file);
                     
+                    // Use the USER'S scene file path, not the blockchain's absolute path
                     let work_unit_for_regen = WorkUnit {
                         task_id: "assembly_regen".to_string(),
                         tile_index: result.tile_index,
-                        scene_file: result.scene_file.clone(),
+                        scene_file: scene_file.clone(), // Critical fix
                         render_settings: "{}".to_string(),
                     };
                     
-                    let verifier_id = "renderer";
-                    let image_bytes = consensus::pow::RenderEngine::run(&work_unit_for_regen, result.nonce, verifier_id)?;
+                    let image_bytes = consensus::pow::RenderEngine::run(&work_unit_for_regen, result.nonce,"regen")?;
                     
                     let mut hasher = Sha256::new();
                     hasher.update(&image_bytes);
@@ -350,46 +362,38 @@ async fn assemble_job(scene_file: String, output_path: String) -> Result<()> {
                         log::info!("Verification successful for tile #{}.", result.tile_index);
                         completed_tiles.insert(result.tile_index, image_bytes);
                     } else {
-                        log::warn!("Hash mismatch for tile #{}: Calculated {} vs Expected {}. Skipping this tile.", 
-                            result.tile_index, calculated_hash, result.output_hash);
+                        log::warn!("HASH MISMATCH for tile #{}. On-chain: {}, Calculated: {}. Skipping.", 
+                                   result.tile_index, &result.output_hash[..10], &calculated_hash[..10]);
                     }
                 }
             }
         }
+        
+        if block.prev_hash == vec![0; 32] { break; }
+        current_hash = block.prev_hash;
     }
 
     if completed_tiles.is_empty() {
-        return Err(anyhow!("No completed tiles found for job: {}", scene_file));
+        log::warn!("No valid & completed tiles found for this job on the blockchain.");
+        return Ok(());
     }
+    
+    let (img_width, img_height) = (1024, 768);
+    let (tile_count_x, tile_count_y) = (4, 4);
+    let tile_width = img_width / tile_count_x;
+    let tile_height = img_height / tile_count_y;
 
-    log::info!("Assembling {} verified tiles...", completed_tiles.len());
-
-    // Assuming a 4x4 grid for 16 tiles, adjust if necessary
-    let tile_count_x = 4;
-    let tile_count_y = 4;
-    let tile_width = 1024 / tile_count_x;
-    let tile_height = 768 / tile_count_y;
-
-    let mut final_image = RgbaImage::new(1024, 768);
+    log::info!("Stitching {} completed tiles into final image...", completed_tiles.len());
+    let mut final_image: RgbaImage = ImageBuffer::new(img_width, img_height);
 
     for (tile_index, image_bytes) in completed_tiles {
+        let tile_img = image::load_from_memory(&image_bytes)?.to_rgba8();
         let tile_x_coord = (tile_index % tile_count_x) * tile_width;
         let tile_y_coord = (tile_index / tile_count_x) * tile_height;
-
-        let tile_image = image::load_from_memory(&image_bytes)?.to_rgba8();
-        
-        // Ensure the tile image dimensions match the expected tile dimensions
-        if tile_image.width() != tile_width || tile_image.height() != tile_height {
-            log::warn!("Tile #{} dimensions mismatch: Expected {}x{}, got {}x{}. Skipping assembly for this tile.",
-                tile_index, tile_width, tile_height, tile_image.width(), tile_image.height());
-            continue;
-        }
-
-        image::imageops::overlay(&mut final_image, &tile_image, tile_x_coord as i64, tile_y_coord as i64); // Cast to i64
+        image::imageops::overlay(&mut final_image, &tile_img, tile_x_coord as i64, tile_y_coord as i64);
     }
 
     final_image.save(&output_path)?;
-    log::info!("Successfully assembled image to {}", output_path);
-
+    log::info!("Assembly complete! Final image saved to: {}", output_path);
     Ok(())
 }
