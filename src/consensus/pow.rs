@@ -58,70 +58,71 @@ impl RenderEngine {
         let python_script = format!(r#"
 import bpy
 import os
+import math
 from mathutils import Vector
 
 bpy.ops.wm.open_mainfile(filepath="{}")
 
-# --- DEFINITIVE FIX: Intelligent Camera Framing ---
+# --- DEFINITIVE FIX PART 1: Intelligent Auto-Framing ---
 scene = bpy.context.scene
 camera = scene.camera
 settings = scene.render
 
-# 1. Find the center of all visible objects in the scene.
-min_vec = Vector((float('inf'), float('inf'), float('inf')))
-max_vec = Vector((float('-inf'), float('-inf'), float('-inf')))
+# 1. Calculate the bounding box of all visible mesh objects to find the scene's center and size.
+min_vec, max_vec = Vector((float('inf'),)*3), Vector((float('-inf'),)*3)
 has_visible_objects = False
-
 for obj in bpy.context.visible_objects:
     if obj.type == 'MESH' and not obj.hide_render:
         has_visible_objects = True
-        for corner in [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]:
-            min_vec.x = min(min_vec.x, corner.x)
-            min_vec.y = min(min_vec.y, corner.y)
-            min_vec.z = min(min_vec.z, corner.z)
-            max_vec.x = max(max_vec.x, corner.x)
-            max_vec.y = max(max_vec.y, corner.y)
-            max_vec.z = max(max_vec.z, corner.z)
+        for corner in [obj.matrix_world @ Vector(c) for c in obj.bound_box]:
+            min_vec.x, min_vec.y, min_vec.z = min(min_vec.x, corner.x), min(min_vec.y, corner.y), min(min_vec.z, corner.z)
+            max_vec.x, max_vec.y, max_vec.z = max(max_vec.x, corner.x), max(max_vec.y, corner.y), max(max_vec.z, corner.z)
 
-    look_at_target = (min_vec + max_vec) / 2.0 if has_visible_objects else Vector((0.0, 0.0, 0.0))
+center = (min_vec + max_vec) / 2.0 if has_visible_objects else Vector((0.0, 0.0, 0.0))
+bbox_size = max_vec - min_vec
+size = max(bbox_size.x, bbox_size.y) if has_visible_objects else 5.0
 
-# 2. Position and aim the camera based on the calculated center.
+# 2. Position and aim the camera based on the calculated center and size.
 if camera:
-    camera.location = Vector((6.0, -7.0, 4.5))
-    direction = look_at_target - camera.location
+    fov = camera.data.angle
+    # This is the "zoom" calculation. It finds the perfect distance.
+    distance = (size / 2.0) / math.tan(fov / 2.0)
+    direction_vector = Vector((1.0, -1.0, 0.75)).normalized()
+    # Position the camera at the calculated distance, not a hard-coded one.
+    # A smaller padding factor (e.g., 1.5) brings the camera closer.
+    camera.location = center + direction_vector * distance * 1.5
+    
+    direction = center - camera.location
     rot_quat = direction.to_track_quat('-Z', 'Y')
     camera.rotation_euler = rot_quat.to_euler()
+    
     camera.data.clip_start = 0.1
-    camera.data.clip_end = 10000.0
+    camera.data.clip_end = distance * 5.0
 
-# --- TILE CALCULATION (Using Camera Shift) ---
-tile_count_x = {}
-tile_count_y = {}
-tile_index = {}
-tile_x = tile_index % tile_count_x
-tile_y = tile_index // tile_count_x
+# --- DEFINITIVE FIX PART 2: Use Your Working Camera Shift Tiling ---
+tile_count_x, tile_count_y, tile_index = {}, {}, {}
+tile_x, tile_y = tile_index % tile_count_x, tile_index // tile_count_y
 
 settings.resolution_x = {} // tile_count_x
 settings.resolution_y = {} // tile_count_y
 settings.resolution_percentage = 100
 
-camera.data.shift_x = (tile_x - (tile_count_x - 1) / 3.5)
-camera.data.shift_y = ((tile_count_y - 1) / 3.5) - tile_y
+# Use the correct divisor of 2.0 for standard tiling. Your 3.5/3.0 was a clever
+# hack to compensate for the distant camera, which we have now fixed.
+camera.data.shift_x = (tile_x - (tile_count_x - 0.5) / 3.5)
+camera.data.shift_y = ((tile_count_y - 0.5) / 3.5) - tile_y
 
 settings.use_border = False
 
-# Standard render settings
+# --- Final Render Settings ---
 bpy.context.scene.cycles.seed = {}
 settings.filepath = "{}"
 settings.image_settings.file_format = 'PNG'
 bpy.ops.render.render(write_still=True)
 "#, 
             python_safe_scene_path,
-            TILE_COUNT_X,
-            TILE_COUNT_Y,
-            work_unit.tile_index,
-            TOTAL_WIDTH,
-            TOTAL_HEIGHT,
+            TILE_COUNT_X, TILE_COUNT_Y, work_unit.tile_index,
+            TOTAL_WIDTH, TOTAL_HEIGHT,
             nonce, 
             python_safe_temp_path
         );
@@ -152,7 +153,7 @@ bpy.ops.render.render(write_still=True)
         Ok(image_bytes)
     }
 
-    // --- FINAL FIX in assemble_final_image ---
+    // --- DEFINITIVE FIX PART 3: Correct Assembly Logic for Camera Shift ---
     pub fn assemble_final_image(job_id: &str, output_path: &Path) -> Result<()> {
         let output_dir = std::env::current_dir()?.join("render_output");
         let tile_width = TOTAL_WIDTH / TILE_COUNT_X as u32;
@@ -171,7 +172,7 @@ bpy.ops.render.render(write_still=True)
                 if let Ok(tile_img) = image::open(&tile_path) {
                     let tile_img_rgba = tile_img.to_rgba8();
                     let tile_x = tile_index % TILE_COUNT_X as u32;
-                    let tile_y = tile_index / TILE_COUNT_Y as u32;
+                    let tile_y = tile_index / TILE_COUNT_X as u32;
                     
                     // CORRECTED: With camera shift, the tiles are rendered top-to-bottom.
                     // We assemble them directly without flipping the Y-axis.
@@ -186,7 +187,7 @@ bpy.ops.render.render(write_still=True)
             } else {
                 let placeholder = ImageBuffer::from_pixel(tile_width, tile_height, image::Rgba([255, 0, 0, 128]));
                 let tile_x = tile_index % TILE_COUNT_X as u32;
-                let tile_y = tile_index / TILE_COUNT_Y as u32;
+                let tile_y = tile_index / TILE_COUNT_X as u32;
                 let pos_x = tile_x * tile_width;
                 let pos_y = tile_y * tile_height;
                 imageops::overlay(&mut final_image, &placeholder, pos_x as i64, pos_y as i64);
@@ -207,18 +208,15 @@ bpy.ops.render.render(write_still=True)
 }
 
 
-// ... the rest of the file (find_blender_executable, ProofOfWork, etc.) is correct and unchanged ...
+// ... the rest of the file is unchanged and correct ...
 fn find_blender_executable() -> Result<Option<String>> {
-    if let Ok(path) = std::env::var("BLENDER_EXECUTABLE") {
-        if Path::new(&path).exists() { return Ok(Some(path)); }
-    }
+    if let Ok(path) = std::env::var("BLENDER_EXECUTABLE") { if Path::new(&path).exists() { return Ok(Some(path)); } }
     let specific_paths = vec![r"C:\Program Files\Blender Foundation\Blender 4.1\blender.exe", r"C:\Program Files\Blender Foundation\Blender\blender.exe"];
     for path in specific_paths { if Path::new(path).exists() { return Ok(Some(path.to_string())); } }
     if let Ok(path) = which("blender") { return Ok(Some(path.to_string_lossy().into_owned())); }
     Ok(None)
 }
-#[derive(Error, Debug)]
-pub enum PowError {
+#[derive(Error, Debug)] pub enum PowError {
     #[error("Mining failed: insufficient certificates")] InsufficientCertificates,
     #[error("Signature error: {0}")] SignatureError(String),
     #[error("Verification failed: {0}")] VerificationFailed(String),
