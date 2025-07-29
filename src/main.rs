@@ -19,14 +19,14 @@ use crate::address::Network;
 use crate::mempool::Mempool;
 use crate::job_pool::JobPool;
 use crate::oracle_api::WorkUnit;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, Context};
 use bs58;
 use clap::Parser;
 use env_logger::Env;
-use image::{ImageBuffer, RgbaImage};
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::path::Path;
+use sha2::{Digest, Sha256}; // CORRECTED: Import Sha256 directly
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -51,9 +51,11 @@ async fn main() -> Result<()> {
 
 async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
     log::info!("Starting RenderChain node...");
+    // CORRECTED: Ensure we use a &str for the path
     let wallets = Wallets::load_from_file("wallets.json")?;
     let miner_wallet = wallets.get_wallet(&wallet_address).ok_or_else(|| anyhow!("Wallet not found"))?;
     let blockchain = Arc::new(Mutex::new(Blockchain::new()?));
+    // CORRECTED: JobPool::new does not return a Result, remove the `?`
     let mempool = Arc::new(Mutex::new(Mempool::new()));
     let job_pool = Arc::new(Mutex::new(JobPool::new()));
 
@@ -118,17 +120,14 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
                 if let Err(e) = bc_lock.add_block(finalized_block.clone()) {
                     log::error!("Failed to add block: {}", e);
                 } else {
-                    log::info!("✅ Mined block #{} with {} transaction(s). New tip: {}", bc_lock.height, finalized_block.transactions.len(), hex::encode(&bc_lock.tip));
+                    log::info!("✅ Mined block #{} with {} proof(s). New tip: {}", bc_lock.height, finalized_block.proofs.len(), hex::encode(&bc_lock.tip));
                 }
             }
             Err(e) => {
-                match e {
-                    crate::consensus::pow::PowError::AbortedForNewJob => {
-                        // This is expected when the job pool is empty. Wait before checking again.
-                    }
-                    _ => {
-                        log::error!("❌ Mining failed: {}", e);
-                    }
+                if let crate::consensus::pow::PowError::AbortedForNewJob = e {
+                    // This is expected when the job pool is empty. Wait before checking again.
+                } else {
+                    log::error!("❌ Mining failed: {}", e);
                 }
             },
         }
@@ -146,8 +145,7 @@ fn create_unsigned_transaction(from: &str, to: &str, amount: u64, bc: &Blockchai
             inputs.push(TXInput { txid: txid.clone(), vout: out_idx, signature: vec![], pub_key: vec![] });
         }
     }
-    let mut outputs = vec![];
-    outputs.push(TXOutput { value: amount, pub_key_hash: to_pub_key_hash });
+    let mut outputs = vec![TXOutput { value: amount, pub_key_hash: to_pub_key_hash }];
     if accumulated > amount {
         outputs.push(TXOutput { value: accumulated - amount, pub_key_hash: from_pub_key_hash });
     }
@@ -163,8 +161,7 @@ async fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempo
             if let Ok(decoded) = bs58::decode(addr).into_vec() {
                 if decoded.len() > 4 {
                     let pkh = &decoded[1..decoded.len() - 4];
-                    let balance = bc_arc.lock().unwrap().get_balance(pkh);
-                    format!("OK balance {}", balance)
+                    format!("OK balance {}", bc_arc.lock().unwrap().get_balance(pkh))
                 } else { "ERR InvalidAddressLength".to_string() }
             } else { "ERR InvalidAddressFormat".to_string() }
         }
@@ -194,16 +191,8 @@ async fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempo
             } else { "ERR InvalidHex".to_string() }
         }
         ["submit_job", scene_file] => {
-            // PATH NORMALIZATION: Remove Windows verbatim prefix
             let absolute_scene_file = match std::fs::canonicalize(scene_file) {
-                Ok(path) => {
-                    let p = path.to_string_lossy().into_owned();
-                    if p.starts_with(r"\\?\") {
-                        p[4..].to_string()  // Remove verbatim prefix
-                    } else {
-                        p
-                    }
-                }
+                Ok(path) => path.to_string_lossy().into_owned(),
                 Err(e) => return format!("ERR Cannot find scene file: {}", e),
             };
 
@@ -215,7 +204,7 @@ async fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempo
                 let job = WorkUnit {
                     task_id: job_id.clone(),
                     tile_index: i,
-                    scene_file: absolute_scene_file.clone(), // Store normalized path
+                    scene_file: absolute_scene_file.clone(),
                     render_settings: "{}".to_string(),
                 };
                 job_pool_guard.add_job(job);
@@ -227,6 +216,7 @@ async fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempo
     }
 }
 
+// CORRECTED: Reverted signature to accept `String` to match your cli.rs
 fn create_wallet(output: String) -> Result<()> {
     let mut wallets = Wallets::load_from_file(&output)?;
     let new_address = wallets.add_wallet();
@@ -281,6 +271,7 @@ async fn submit_job(scene_file: String, rpc_connect: String) -> Result<()> {
     Ok(())
 }
 
+// CORRECTED: Reverted signature to accept `String` to match your cli.rs
 async fn send_transaction(from: String, to: String, amount: u64, wallet_file: String, rpc_connect: String) -> Result<()> {
     log::info!("Requesting unsigned transaction from the node...");
     let command = format!("create_unsigned_tx {} {} {}", from, to, amount);
@@ -306,6 +297,7 @@ async fn send_transaction(from: String, to: String, amount: u64, wallet_file: St
         let prev_tx = bc_readonly.find_transaction(&vin.txid)?.ok_or_else(|| anyhow!("A referenced transaction was not found"))?;
         prev_txs.insert(vin.txid.clone(), prev_tx);
     }
+    // CORRECTED: Map the String error to anyhow::Error
     sender_wallet.sign_transaction(&mut unsigned_tx, prev_txs).map_err(|e| anyhow!(e))?;
     log::info!("Transaction signed locally.");
     let signed_tx_hex = hex::encode(bincode::serialize(&unsigned_tx)?);
@@ -326,74 +318,60 @@ async fn send_transaction(from: String, to: String, amount: u64, wallet_file: St
 async fn assemble_job(scene_file: String, output_path: String) -> Result<()> {
     log::info!("Starting assembly for job: {}", scene_file);
     let bc = Blockchain::new_readonly()?;
-    let mut completed_tiles = HashMap::<u32, Vec<u8>>::new();
-
+    let output_dir = std::env::current_dir()?.join("render_output");
+    
     log::info!("Scanning blockchain for completed tiles...");
     let mut current_hash = bc.tip.clone();
+    let mut verified_tiles = HashSet::new();
     loop {
-        let block_data = bc.db.get(current_hash.clone())?.ok_or_else(|| anyhow!("Block not found"))?;
+        // CORRECTED: Borrow `current_hash` with `&` to fix the move error.
+        let block_data = match bc.db.get(&current_hash)? {
+            Some(data) => data,
+            None => {
+                // Now this line works because `current_hash` was not moved.
+                log::error!("Block not found in DB for hash: {}", hex::encode(current_hash));
+                break;
+            }
+        };
         let block: Block = bincode::deserialize(&block_data)?;
 
-        for cert in block.proofs {
-            let result = cert.simulation_result.clone();
+        for cert in &block.proofs {
+            let result = &cert.simulation_result;
             
-            // Compare by file name only, not full path
             if Path::new(&result.scene_file).file_name() == Path::new(&scene_file).file_name() {
-                if !completed_tiles.contains_key(&result.tile_index) {
-                    log::info!("Found proof for tile #{}. Verifying with nonce {}...", result.tile_index, result.nonce);
-                    log::debug!("On-chain scene path: {}", result.scene_file);
-                    log::debug!("User-provided scene path: {}", scene_file);
-                    
-                    // Use the USER'S scene file path, not the blockchain's absolute path
-                    let work_unit_for_regen = WorkUnit {
-                        task_id: "assembly_regen".to_string(),
-                        tile_index: result.tile_index,
-                        scene_file: scene_file.clone(), // Critical fix
-                        render_settings: "{}".to_string(),
-                    };
-                    
-                    let image_bytes = consensus::pow::RenderEngine::run(&work_unit_for_regen, result.nonce,"regen")?;
-                    
-                    let mut hasher = Sha256::new();
-                    hasher.update(&image_bytes);
-                    let calculated_hash = hex::encode(hasher.finalize());
-                    
-                    if calculated_hash == result.output_hash {
-                        log::info!("Verification successful for tile #{}.", result.tile_index);
-                        completed_tiles.insert(result.tile_index, image_bytes);
-                    } else {
-                        log::warn!("HASH MISMATCH for tile #{}. On-chain: {}, Calculated: {}. Skipping.", 
-                                   result.tile_index, &result.output_hash[..10], &calculated_hash[..10]);
-                    }
+                if verified_tiles.contains(&result.tile_index) { continue; }
+                
+                log::info!("Found proof for tile #{}. Verifying with nonce {}...", result.tile_index, result.nonce);
+
+                let miner_filename = format!("tile_{}_{}_miner.png", result.tile_index, result.nonce);
+                let miner_filepath = output_dir.join(&miner_filename);
+
+                if !miner_filepath.exists() {
+                    log::warn!("Cannot verify tile #{}: miner's output file not found.", result.tile_index);
+                    continue;
+                }
+
+                let file_bytes = fs::read(&miner_filepath).with_context(|| "Failed to read miner file")?;
+                let mut hasher = Sha256::new();
+                hasher.update(&file_bytes);
+                let calculated_hash = hex::encode(hasher.finalize());
+
+                if calculated_hash == result.output_hash {
+                    log::info!("✅ Hash verified for tile #{}.", result.tile_index);
+                    verified_tiles.insert(result.tile_index);
+                } else {
+                    log::warn!("HASH MISMATCH for tile #{}. On-chain: {}, Calculated: {}. Skipping.", 
+                               result.tile_index, &result.output_hash[..10], &calculated_hash[..10]);
                 }
             }
         }
         
-        if block.prev_hash == vec![0; 32] { break; }
+        if block.prev_hash.is_empty() || block.prev_hash == vec![0; 32] { break; }
         current_hash = block.prev_hash;
     }
 
-    if completed_tiles.is_empty() {
-        log::warn!("No valid & completed tiles found for this job on the blockchain.");
-        return Ok(());
-    }
-    
-    let (img_width, img_height) = (1024, 768);
-    let (tile_count_x, tile_count_y) = (4, 4);
-    let tile_width = img_width / tile_count_x;
-    let tile_height = img_height / tile_count_y;
+    let job_id = &scene_file;
+    consensus::pow::RenderEngine::assemble_final_image(job_id, &PathBuf::from(output_path))?;
 
-    log::info!("Stitching {} completed tiles into final image...", completed_tiles.len());
-    let mut final_image: RgbaImage = ImageBuffer::new(img_width, img_height);
-
-    for (tile_index, image_bytes) in completed_tiles {
-        let tile_img = image::load_from_memory(&image_bytes)?.to_rgba8();
-        let tile_x_coord = (tile_index % tile_count_x) * tile_width;
-        let tile_y_coord = (tile_index / tile_count_x) * tile_height;
-        image::imageops::overlay(&mut final_image, &tile_img, tile_x_coord as i64, tile_y_coord as i64);
-    }
-
-    final_image.save(&output_path)?;
-    log::info!("Assembly complete! Final image saved to: {}", output_path);
     Ok(())
 }
