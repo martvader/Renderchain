@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "foldchain")]
+#[command(name = "renderchain")]
 #[command(version = "1.0")]
 #[command(about = "RenderChain CLI - A Decentralized Rendering Network")]
 pub struct Cli {
@@ -50,16 +50,13 @@ pub enum Commands {
         /// Path to the .blend scene file to be rendered
         #[arg(long)]
         scene_file: String,
-        /// Address of the RPC server to connect to
-        #[arg(long, default_value = "127.0.0.1:9001")]
-        rpc_connect: String,
     },
 
     /// Assemble the final image for a completed render job
     AssembleJob {
-        /// The scene file of the job you want to assemble (e.g., "monkey.blend")
+        /// The job ID of the job you want to assemble
         #[arg(long)]
-        scene_file: String,
+        job_id: String,
         /// The output path for the final, stitched image
         #[arg(long, default_value = "final_render.png")]
         output: String,

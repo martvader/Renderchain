@@ -11,7 +11,7 @@ mod job_pool;
 
 use crate::cli::{Cli, Commands};
 use crate::core::blockchain::Blockchain;
-use crate::consensus::pow::ProofOfWork;
+use crate::consensus::pow::{ProofOfWork, PowError}; // Added PowError
 use crate::core::block::Block;
 use crate::core::transaction::{Transaction, TXInput, TXOutput};
 use crate::wallets::Wallets;
@@ -23,12 +23,11 @@ use anyhow::{Result, anyhow, Context};
 use bs58;
 use clap::Parser;
 use env_logger::Env;
-use sha2::{Digest, Sha256}; // CORRECTED: Import Sha256 directly
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -43,25 +42,28 @@ async fn main() -> Result<()> {
         Commands::CreateWallet { output } => create_wallet(output),
         Commands::Status { rpc_connect } => show_blockchain_status(rpc_connect).await,
         Commands::GetBalance { address, rpc_connect } => get_balance(address, rpc_connect).await,
-        Commands::SubmitJob { scene_file, rpc_connect } => submit_job(scene_file, rpc_connect).await,
-        Commands::AssembleJob { scene_file, output } => assemble_job(scene_file, output).await,
+        Commands::SubmitJob { scene_file } => {
+            let rpc_connect = "127.0.0.1:9001".to_string(); // Use your default RPC port
+            submit_job(scene_file, rpc_connect).await
+        },
+        Commands::AssembleJob { job_id, output } => assemble_job(job_id, output).await,
         Commands::Send { from, to, amount, wallet, rpc_connect } => send_transaction(from, to, amount, wallet, rpc_connect).await,
     }
 }
 
+// FIX: This function is now corrected to be a passive worker.
 async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
     log::info!("Starting RenderChain node...");
-    // CORRECTED: Ensure we use a &str for the path
     let wallets = Wallets::load_from_file("wallets.json")?;
     let miner_wallet = wallets.get_wallet(&wallet_address).ok_or_else(|| anyhow!("Wallet not found"))?;
     let blockchain = Arc::new(Mutex::new(Blockchain::new()?));
-    // CORRECTED: JobPool::new does not return a Result, remove the `?`
     let mempool = Arc::new(Mutex::new(Mempool::new()));
     let job_pool = Arc::new(Mutex::new(JobPool::new()));
 
     let listener = TcpListener::bind(&rpc_bind).await?;
     log::info!("RPC server listening on {}", rpc_bind);
     
+    // --- RPC Server Thread ---
     let bc_for_rpc = blockchain.clone();
     let mempool_for_rpc = mempool.clone();
     let job_pool_for_rpc = job_pool.clone();
@@ -85,19 +87,37 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
         }
     });
     
+    // --- Initial Node Info ---
     {
         let bc = blockchain.lock().unwrap();
         log::info!("Blockchain initialized with height: {}", bc.height);
         log::info!("Tip: {}", hex::encode(&bc.tip));
         log::info!("Miner address: {}", miner_wallet.get_address(Network::Mainnet));
     }
-    log::info!("Starting mining loop...");
+    log::info!("Starting mining loop... Waiting for jobs to be submitted.");
     
+    // --- Main Mining Loop ---
     loop {
+        // Step 1: Check if there are any jobs in the pool.
+        let has_jobs = {
+            let job_pool_guard = job_pool.lock().unwrap();
+            !job_pool_guard.is_empty()
+        };
+
+        // If no jobs, wait and continue the loop.
+        if !has_jobs {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue; // Go back to the start of the loop to check again.
+        }
+
+        // If we reach here, there are jobs to be done.
+        log::info!("Jobs available. Starting new mining round...");
+        
         let miner_address_str = miner_wallet.get_address(Network::Mainnet);
         let decoded_address = bs58::decode(&miner_address_str).into_vec()?;
         let miner_pub_key_hash = decoded_address[1..decoded_address.len() - 4].to_vec();
         
+        // Step 2: Create a new block candidate to hold the transaction and proofs.
         let new_block_candidate = {
             let bc = blockchain.lock().unwrap();
             let coinbase_tx = Transaction::new_coinbase_tx(&miner_pub_key_hash, format!("Block #{} reward", bc.height + 1));
@@ -110,7 +130,10 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
             Block::new(1, transactions.clone(), bc.tip.clone())?
         };
         
+        // Step 3: The miner no longer creates its own jobs. It just processes what's in the pool.
         let mut pow = ProofOfWork::new(new_block_candidate);
+        
+        // The `run` method will now pull one job from the shared `job_pool`.
         match pow.run(job_pool.clone()) {
             Ok((certificates, winning_nonce)) => {
                 let mut finalized_block = pow.into_block();
@@ -120,20 +143,27 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
                 if let Err(e) = bc_lock.add_block(finalized_block.clone()) {
                     log::error!("Failed to add block: {}", e);
                 } else {
-                    log::info!("✅ Mined block #{} with {} proof(s). New tip: {}", bc_lock.height, finalized_block.proofs.len(), hex::encode(&bc_lock.tip));
+                    log::info!("✅ Mined block #{} with {} proof(s). New tip: {}", 
+                        bc_lock.height, 
+                        finalized_block.proofs.len(), 
+                        hex::encode(&bc_lock.tip)
+                    );
                 }
             }
+            // This error is expected and normal. It just means the job was taken by another process
+            // or the pool became empty while we were setting up. The loop will simply restart.
+            Err(PowError::AbortedForNewJob) => {
+                log::info!("Mining round aborted, job likely completed or pool is empty. Checking again...");
+            }
             Err(e) => {
-                if let crate::consensus::pow::PowError::AbortedForNewJob = e {
-                    // This is expected when the job pool is empty. Wait before checking again.
-                } else {
-                    log::error!("❌ Mining failed: {}", e);
-                }
+                log::error!("❌ Mining failed: {}", e);
             },
         }
-        thread::sleep(Duration::from_secs(1));
+        // Small delay to prevent a tight loop on continuous errors.
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
+
 
 fn create_unsigned_transaction(from: &str, to: &str, amount: u64, bc: &Blockchain) -> Result<Transaction> {
     let from_pub_key_hash = bs58::decode(from).into_vec()?[1..21].to_vec();
@@ -199,16 +229,19 @@ async fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempo
             const TOTAL_TILES: u32 = 16; 
             let job_id = format!("job_{}", chrono::Utc::now().timestamp_micros());
             log::info!("New render job received: {}. Queuing {} tiles for {}...", &job_id, TOTAL_TILES, &absolute_scene_file);
-            let mut job_pool_guard = job_pool_arc.lock().unwrap();
-            for i in 0..TOTAL_TILES {
-                let job = WorkUnit {
+            
+            let work_units: Vec<WorkUnit> = (0..TOTAL_TILES).map(|i| {
+                WorkUnit {
                     task_id: job_id.clone(),
                     tile_index: i,
                     scene_file: absolute_scene_file.clone(),
                     render_settings: "{}".to_string(),
-                };
-                job_pool_guard.add_job(job);
-            }
+                }
+            }).collect();
+            
+            let mut job_pool_guard = job_pool_arc.lock().unwrap();
+            job_pool_guard.add_jobs(work_units);
+            
             log::info!("All {} tiles for job {} have been queued.", TOTAL_TILES, &job_id);
             format!("OK job_submitted {}", job_id)
         }
@@ -216,7 +249,6 @@ async fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempo
     }
 }
 
-// CORRECTED: Reverted signature to accept `String` to match your cli.rs
 fn create_wallet(output: String) -> Result<()> {
     let mut wallets = Wallets::load_from_file(&output)?;
     let new_address = wallets.add_wallet();
@@ -271,7 +303,6 @@ async fn submit_job(scene_file: String, rpc_connect: String) -> Result<()> {
     Ok(())
 }
 
-// CORRECTED: Reverted signature to accept `String` to match your cli.rs
 async fn send_transaction(from: String, to: String, amount: u64, wallet_file: String, rpc_connect: String) -> Result<()> {
     log::info!("Requesting unsigned transaction from the node...");
     let command = format!("create_unsigned_tx {} {} {}", from, to, amount);
@@ -297,7 +328,6 @@ async fn send_transaction(from: String, to: String, amount: u64, wallet_file: St
         let prev_tx = bc_readonly.find_transaction(&vin.txid)?.ok_or_else(|| anyhow!("A referenced transaction was not found"))?;
         prev_txs.insert(vin.txid.clone(), prev_tx);
     }
-    // CORRECTED: Map the String error to anyhow::Error
     sender_wallet.sign_transaction(&mut unsigned_tx, prev_txs).map_err(|e| anyhow!(e))?;
     log::info!("Transaction signed locally.");
     let signed_tx_hex = hex::encode(bincode::serialize(&unsigned_tx)?);
@@ -315,30 +345,28 @@ async fn send_transaction(from: String, to: String, amount: u64, wallet_file: St
     Ok(())
 }
 
-async fn assemble_job(scene_file: String, output_path: String) -> Result<()> {
-    log::info!("Starting assembly for job: {}", scene_file);
+async fn assemble_job(job_id: String, output_path: String) -> Result<()> {
+    log::info!("Starting assembly for job ID: {}", job_id);
     let bc = Blockchain::new_readonly()?;
     let output_dir = std::env::current_dir()?.join("render_output");
     
-    log::info!("Scanning blockchain for completed tiles...");
+    log::info!("Scanning blockchain for completed tiles for job '{}'...", &job_id);
     let mut current_hash = bc.tip.clone();
     let mut verified_tiles = HashSet::new();
     loop {
-        // CORRECTED: Borrow `current_hash` with `&` to fix the move error.
         let block_data = match bc.db.get(&current_hash)? {
             Some(data) => data,
             None => {
-                // Now this line works because `current_hash` was not moved.
-                log::error!("Block not found in DB for hash: {}", hex::encode(current_hash));
+                log::warn!("Block not found in DB for hash: {}. Reached end of scannable chain.", hex::encode(current_hash));
                 break;
             }
         };
         let block: Block = bincode::deserialize(&block_data)?;
 
         for cert in &block.proofs {
-            let result = &cert.simulation_result;
-            
-            if Path::new(&result.scene_file).file_name() == Path::new(&scene_file).file_name() {
+            if cert.task_id == job_id {
+                let result = &cert.simulation_result;
+                
                 if verified_tiles.contains(&result.tile_index) { continue; }
                 
                 log::info!("Found proof for tile #{}. Verifying with nonce {}...", result.tile_index, result.nonce);
@@ -347,11 +375,11 @@ async fn assemble_job(scene_file: String, output_path: String) -> Result<()> {
                 let miner_filepath = output_dir.join(&miner_filename);
 
                 if !miner_filepath.exists() {
-                    log::warn!("Cannot verify tile #{}: miner's output file not found.", result.tile_index);
+                    log::warn!("Cannot verify tile #{}: miner's output file not found at {}", result.tile_index, miner_filepath.display());
                     continue;
                 }
 
-                let file_bytes = fs::read(&miner_filepath).with_context(|| "Failed to read miner file")?;
+                let file_bytes = fs::read(&miner_filepath).with_context(|| format!("Failed to read miner file: {}", miner_filepath.display()))?;
                 let mut hasher = Sha256::new();
                 hasher.update(&file_bytes);
                 let calculated_hash = hex::encode(hasher.finalize());
@@ -370,8 +398,12 @@ async fn assemble_job(scene_file: String, output_path: String) -> Result<()> {
         current_hash = block.prev_hash;
     }
 
-    let job_id = &scene_file;
-    consensus::pow::RenderEngine::assemble_final_image(job_id, &PathBuf::from(output_path))?;
+    if verified_tiles.is_empty() {
+        return Err(anyhow!("Could not find any completed tiles for job '{}' on the blockchain.", job_id));
+    }
 
+    consensus::pow::RenderEngine::assemble_final_image(&job_id, &PathBuf::from(output_path))
+        .context("Failed to assemble final image")?;
+    
     Ok(())
 }

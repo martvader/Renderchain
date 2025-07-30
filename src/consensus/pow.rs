@@ -14,37 +14,43 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use which::which;
 use image::{ImageBuffer, imageops};
-use std::path::Path;
+use std::path::Path; // FIX: Removed unused PathBuf
 
 pub const NUM_ORACLES: usize = 5;
 pub const REQUIRED_SIGNATURES: usize = 3;
-const TILE_COUNT_X: usize = 4;
-const TILE_COUNT_Y: usize = 4;
+pub const TILE_COUNT_X: usize = 4;
+pub const TILE_COUNT_Y: usize = 4;
 const TOTAL_WIDTH: u32 = 1024;
 const TOTAL_HEIGHT: u32 = 768;
 
 pub struct RenderEngine;
 
+// ... rest of pow.rs remains the same as your last working version ...
+// The only change was removing PathBuf from the `use` statement.
+
 impl RenderEngine {
     pub fn run(work_unit: &WorkUnit, nonce: u32, unique_id: &str) -> Result<Vec<u8>> {
-        let clean_path = if work_unit.scene_file.starts_with(r"\\?\") {
-            work_unit.scene_file[4..].to_string()
+        // Handle both relative and absolute paths
+        let scene_path = Path::new(&work_unit.scene_file);
+        let abs_scene_path = if scene_path.is_relative() {
+            std::env::current_dir()?.join(scene_path)
         } else {
-            work_unit.scene_file.clone()
+            scene_path.to_path_buf()
         };
         
-        if !std::path::Path::new(&clean_path).exists() {
-            return Err(anyhow!("Scene file not found: {}", clean_path));
+        if !abs_scene_path.exists() {
+            return Err(anyhow!(
+                "Scene file not found: {}\nAbsolute path: {}", 
+                work_unit.scene_file,
+                abs_scene_path.display()
+            ));
         }
         
-        let absolute_path = std::fs::canonicalize(&clean_path)
-            .with_context(|| format!("Failed to get absolute path for: {}", clean_path))?;
-        let mut path_str = absolute_path.to_string_lossy().into_owned();
+        let mut path_str = abs_scene_path.to_string_lossy().into_owned();
         if path_str.starts_with(r"\\?\") {
             path_str = path_str[4..].to_string();
         }
         let python_safe_scene_path = path_str.replace('\\', "/");
-        
         let output_dir = std::env::current_dir()?.join("render_output");
         fs::create_dir_all(&output_dir)?;
 
@@ -200,52 +206,127 @@ bpy.ops.render.render(write_still=True)
         log::info!("[Job {}] Final image saved to: {}", job_id, output_path.display());
         
         if found_tiles_count < total_tiles as usize {
-            Err(anyhow!("[Job {}] Assembly incomplete.", job_id))
+            Err(anyhow!("[Job {}] Assembly incomplete. Missing {} tiles", 
+                job_id, 
+                total_tiles as usize - found_tiles_count
+            ))
         } else {
             Ok(())
         }
     }
 }
 
-
-// ... the rest of the file is unchanged and correct ...
 fn find_blender_executable() -> Result<Option<String>> {
-    if let Ok(path) = std::env::var("BLENDER_EXECUTABLE") { if Path::new(&path).exists() { return Ok(Some(path)); } }
-    let specific_paths = vec![r"C:\Program Files\Blender Foundation\Blender 4.1\blender.exe", r"C:\Program Files\Blender Foundation\Blender\blender.exe"];
-    for path in specific_paths { if Path::new(path).exists() { return Ok(Some(path.to_string())); } }
-    if let Ok(path) = which("blender") { return Ok(Some(path.to_string_lossy().into_owned())); }
+    if let Ok(path) = std::env::var("BLENDER_EXECUTABLE") { 
+        if Path::new(&path).exists() { 
+            return Ok(Some(path)); 
+        } 
+    }
+    let specific_paths = vec![
+        r"C:\Program Files\Blender Foundation\Blender 4.1\blender.exe", 
+        r"C:\Program Files\Blender Foundation\Blender\blender.exe"
+    ];
+    for path in specific_paths { 
+        if Path::new(path).exists() { 
+            return Ok(Some(path.to_string())); 
+        } 
+    }
+    if let Ok(path) = which("blender") { 
+        return Ok(Some(path.to_string_lossy().into_owned())); 
+    }
     Ok(None)
 }
-#[derive(Error, Debug)] pub enum PowError {
-    #[error("Mining failed: insufficient certificates")] InsufficientCertificates,
-    #[error("Signature error: {0}")] SignatureError(String),
-    #[error("Verification failed: {0}")] VerificationFailed(String),
-    #[error("Render engine error: {0}")] RenderError(String),
-    #[error("Idle task aborted for new job")] AbortedForNewJob,
-    #[error("Oracle verification failed: Hash mismatch")] OracleHashMismatch,
+
+#[derive(Error, Debug)] 
+pub enum PowError {
+    #[error("Mining failed: insufficient certificates")] 
+    InsufficientCertificates,
+    #[error("Signature error: {0}")] 
+    SignatureError(String),
+    #[error("Verification failed: {0}")] 
+    VerificationFailed(String),
+    #[error("Render engine error: {0}")] 
+    RenderError(String),
+    #[error("Idle task aborted for new job")] 
+    AbortedForNewJob,
+    #[error("Oracle verification failed: Hash mismatch")] 
+    OracleHashMismatch,
+    #[error("Tile rendering failed: {0}")]
+    TileRenderError(String),
 }
-fn oracle_issue_certificate(oracle_key: &SigningKey, oracle_index: usize, work_unit: &WorkUnit, miner_id: String, nonce: u32, canonical_hash: &str) -> Result<CertificateOfWork, PowError> {
+
+fn oracle_issue_certificate(
+    oracle_key: &SigningKey, 
+    oracle_index: usize, 
+    work_unit: &WorkUnit, 
+    miner_id: String, 
+    nonce: u32, 
+    canonical_hash: &str
+) -> Result<CertificateOfWork, PowError> {
     println!("[Oracle #{}] Verifying render for tile #{}...", oracle_index, work_unit.tile_index);
     let miner_filename = format!("tile_{}_{}_miner.png", work_unit.tile_index, nonce);
     let output_dir = std::env::current_dir().unwrap().join("render_output");
     let miner_path = output_dir.join(miner_filename);
-    if !miner_path.exists() { return Err(PowError::RenderError("Miner render not found for oracle verification".to_string())); }
-    let verification_bytes = fs::read(&miner_path).map_err(|e| PowError::RenderError(e.to_string()))?;
+    
+    if !miner_path.exists() { 
+        return Err(PowError::RenderError(
+            format!("Miner render not found at: {}", miner_path.display())
+        )); 
+    }
+    
+    let verification_bytes = fs::read(&miner_path)
+        .map_err(|e| PowError::RenderError(e.to_string()))?;
+    
     let mut hasher = Sha256::new();
     hasher.update(&verification_bytes);
     let result_hash_hex = hex::encode(hasher.finalize());
+    
     if result_hash_hex != canonical_hash {
-        println!("[Oracle #{}] HASH MISMATCH! Expected {}, miner provided {}. Refusing to sign.", oracle_index, &canonical_hash[..10], &result_hash_hex[..10]);
+        println!("[Oracle #{}] HASH MISMATCH! Expected {}, miner provided {}. Refusing to sign.", 
+            oracle_index, 
+            &canonical_hash[..10], 
+            &result_hash_hex[..10]
+        );
         return Err(PowError::OracleHashMismatch);
     }
-    println!("[Oracle #{}] Verification successful. Hash: {}... Issuing certificate.", oracle_index, &result_hash_hex[..10]);
-    let render_result = RenderResult { scene_file: work_unit.scene_file.clone(), tile_index: work_unit.tile_index, nonce, output_hash: result_hash_hex };
+    
+    println!("[Oracle #{}] Verification successful. Hash: {}... Issuing certificate.", 
+        oracle_index, 
+        &result_hash_hex[..10]
+    );
+    
+    let render_result = RenderResult { 
+        scene_file: work_unit.scene_file.clone(), 
+        tile_index: work_unit.tile_index, 
+        nonce, 
+        output_hash: result_hash_hex 
+    };
+    
     let timestamp = Utc::now().timestamp();
-    let message_to_sign = format!("{}|{}|{}|{}", work_unit.task_id, miner_id, oracle_index, timestamp);
+    let message_to_sign = format!("{}|{}|{}|{}", 
+        work_unit.task_id, 
+        miner_id, 
+        oracle_index, 
+        timestamp
+    );
+    
     let signature: Signature = oracle_key.sign(message_to_sign.as_bytes());
-    Ok(CertificateOfWork { task_id: work_unit.task_id.clone(), miner_id, oracle_id: oracle_index, timestamp, oracle_signature: signature.to_bytes().to_vec(), simulation_result: render_result })
+    
+    Ok(CertificateOfWork { 
+        task_id: work_unit.task_id.clone(), 
+        miner_id, 
+        oracle_id: oracle_index, 
+        timestamp, 
+        oracle_signature: signature.to_bytes().to_vec(), 
+        simulation_result: render_result 
+    })
 }
-pub struct ProofOfWork { block: Block }
+
+pub struct ProofOfWork { 
+    block: Block,
+    total_tiles: usize,
+}
+
 impl ProofOfWork {
     fn get_oracle_private_keys(&self) -> Vec<SigningKey> {
         (0..NUM_ORACLES).map(|i| {
@@ -255,40 +336,110 @@ impl ProofOfWork {
             SigningKey::from_bytes((&secret_bytes).into()).expect("Invalid oracle key")
         }).collect()
     }
-    pub fn new(block: Block) -> Self { ProofOfWork { block } }
-    pub fn into_block(self) -> Block { self.block }
+    
+    pub fn new(block: Block) -> Self { 
+        ProofOfWork { 
+            block,
+            total_tiles: TILE_COUNT_X * TILE_COUNT_Y,
+        } 
+    }
+    
+    pub fn into_block(self) -> Block { 
+        self.block 
+    }
+    
     pub fn run(&mut self, job_pool: Arc<Mutex<JobPool>>) -> Result<(Vec<CertificateOfWork>, u32), PowError> {
         let work_unit = {
-            let mut job_pool_guard = job_pool.lock().unwrap();
-            match job_pool_guard.get_next_job() {
-                Some(job) => { log::info!("[Miner] Picked up user job: {}", job.task_id); job },
-                None => { return Err(PowError::AbortedForNewJob); }
+            let mut job_pool_guard = job_pool.lock()
+                .map_err(|e| PowError::TileRenderError(format!("Job pool lock failed: {}", e)))?;
+            
+            match job_pool_guard.take_next_job() {
+                Some(job) => { 
+                    let remaining = job_pool_guard.len();
+                    
+                    log::info!(
+                        "[Miner] Processing tile {}/{} ({} tiles remaining)", 
+                        job.tile_index + 1,
+                        self.total_tiles,
+                        remaining
+                    );
+                    job
+                },
+                None => { 
+                    log::warn!("No jobs available in pool");
+                    return Err(PowError::AbortedForNewJob); 
+                }
             }
         };
+        
         let nonce = work_unit.tile_index;
         println!("\n[Miner] Performing canonical render for tile #{}...", work_unit.tile_index);
-        let canonical_render_bytes = RenderEngine::run(&work_unit, nonce, "miner").map_err(|e| PowError::RenderError(e.to_string()))?;
+        
+        let canonical_render_bytes = RenderEngine::run(&work_unit, nonce, "miner")
+            .map_err(|e| PowError::RenderError(e.to_string()))?;
+        
         let mut hasher = Sha256::new();
         hasher.update(&canonical_render_bytes);
         let canonical_hash = hex::encode(hasher.finalize());
+        
         println!("[Miner] Canonical hash established: {}...", &canonical_hash[..10]);
         println!("[Miner] Submitting tile for verification by oracles...");
+        
         let oracle_keys = self.get_oracle_private_keys();
         let miner_id = "miner_node_1".to_string();
-        let valid_certificates: Vec<_> = (0..NUM_ORACLES).into_par_iter().filter_map(|i| oracle_issue_certificate(&oracle_keys[i], i, &work_unit, miner_id.clone(), nonce, &canonical_hash).ok()).collect();
+        
+        let valid_certificates: Vec<_> = (0..NUM_ORACLES)
+            .into_par_iter()
+            .filter_map(|i| {
+                oracle_issue_certificate(
+                    &oracle_keys[i], 
+                    i, 
+                    &work_unit, 
+                    miner_id.clone(), 
+                    nonce, 
+                    &canonical_hash
+                ).ok()
+            })
+            .collect();
+            
         if valid_certificates.len() < REQUIRED_SIGNATURES {
-            println!("[Miner] Failed to collect enough valid certificates (got {}, need {}).", valid_certificates.len(), REQUIRED_SIGNATURES);
+            println!(
+                "[Miner] Failed to collect enough valid certificates (got {}, need {}).",
+                valid_certificates.len(), 
+                REQUIRED_SIGNATURES
+            );
             return Err(PowError::InsufficientCertificates);
         }
+        
         println!("\n[Miner] Collected {} valid certificates for the render.", valid_certificates.len());
         Ok((valid_certificates, nonce))
     }
+    
     fn validate_certificate(&self, cert: &CertificateOfWork, federation_keys: &[VerifyingKey]) -> Result<(), PowError> {
-        if cert.oracle_id >= federation_keys.len() { return Err(PowError::SignatureError(format!("Invalid oracle ID: {}", cert.oracle_id))); }
+        if cert.oracle_id >= federation_keys.len() { 
+            return Err(PowError::SignatureError(
+                format!("Invalid oracle ID: {}", cert.oracle_id)
+            )); 
+        }
+        
         let pub_key = &federation_keys[cert.oracle_id];
-        let message = format!("{}|{}|{}|{}", cert.task_id, cert.miner_id, cert.oracle_id, cert.timestamp);
-        let signature = Signature::from_slice(&cert.oracle_signature).map_err(|e| PowError::SignatureError(e.to_string()))?;
-        pub_key.verify(message.as_bytes(), &signature).map_err(|e| PowError::SignatureError(e.to_string()))?;
+        let message = format!("{}|{}|{}|{}", 
+            cert.task_id, 
+            cert.miner_id, 
+            cert.oracle_id, 
+            cert.timestamp
+        );
+        
+        let signature = Signature::from_slice(&cert.oracle_signature)
+            .map_err(|e| PowError::SignatureError(e.to_string()))?;
+        
+        pub_key.verify(message.as_bytes(), &signature)
+            .map_err(|e| PowError::SignatureError(e.to_string()))?;
+        
         Ok(())
+    }
+    
+    pub fn total_tiles(&self) -> usize {
+        self.total_tiles
     }
 }
