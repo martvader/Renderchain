@@ -87,10 +87,10 @@ if camera:
     fov = camera.data.angle
     # This is the "zoom" calculation. It finds the perfect distance.
     distance = (size / 2.0) / math.tan(fov / 2.0)
-    direction_vector = Vector((1.0, -1.0, 0.75)).normalized()
+    direction_vector = Vector((1.5, -1.0, 0.15)).normalized()
     # Position the camera at the calculated distance, not a hard-coded one.
     # A smaller padding factor (e.g., 1.5) brings the camera closer.
-    camera.location = center + direction_vector * distance * 1.5
+    camera.location = center + direction_vector * distance * 1.0
     
     direction = center - camera.location
     rot_quat = direction.to_track_quat('-Z', 'Y')
@@ -109,8 +109,8 @@ settings.resolution_percentage = 100
 
 # Use the correct divisor of 2.0 for standard tiling. Your 3.5/3.0 was a clever
 # hack to compensate for the distant camera, which we have now fixed.
-camera.data.shift_x = (tile_x - (tile_count_x - 0.5) / 3.5)
-camera.data.shift_y = ((tile_count_y - 0.5) / 3.5) - tile_y
+camera.data.shift_x = (tile_x - (tile_count_x - 0.5) / 3.0)
+camera.data.shift_y = ((tile_count_y - 0.5) / 3.0) - tile_y
 
 settings.use_border = False
 
