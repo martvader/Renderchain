@@ -55,40 +55,18 @@ impl RenderEngine {
         
         let python_script = format!(r#"
 import bpy
-import os
-import math
-from mathutils import Vector
 
 bpy.ops.wm.open_mainfile(filepath="{}")
 
-# --- Auto-Framing Camera ---
 scene = bpy.context.scene
-camera = scene.camera
 settings = scene.render
 
-min_vec, max_vec = Vector((float('inf'),)*3), Vector((float('-inf'),)*3)
-has_visible_objects = False
-for obj in bpy.context.visible_objects:
-    if obj.type == 'MESH' and not obj.hide_render:
-        has_visible_objects = True
-        for corner in [obj.matrix_world @ Vector(c) for c in obj.bound_box]:
-            min_vec.x, min_vec.y, min_vec.z = min(min_vec.x, corner.x), min(min_vec.y, corner.y), min(min_vec.z, corner.z)
-            max_vec.x, max_vec.y, max_vec.z = max(max_vec.x, corner.x), max(max_vec.y, corner.y), max(max_vec.z, corner.z)
-
-center = (min_vec + max_vec) / 2.0 if has_visible_objects else Vector((0.0, 0.0, 0.0))
-bbox_size = max_vec - min_vec
-size = max(bbox_size.x, bbox_size.y) if has_visible_objects else 5.0
-
-if camera:
-    fov = camera.data.angle
-    distance = (size / 2.0) / math.tan(fov / 2.0)
-    direction_vector = Vector((1.5, -1.0, 0.15)).normalized()
-    camera.location = center + direction_vector * distance * 1.0
-    direction = center - camera.location
-    rot_quat = direction.to_track_quat('-Z', 'Y')
-    camera.rotation_euler = rot_quat.to_euler()
-    camera.data.clip_start = 0.1
-    camera.data.clip_end = distance * 5.0
+# --- RENDER SETTINGS ---
+# We explicitly set the engine and a reasonable sample count to ensure consistency.
+# The camera position, lighting, and materials are now entirely respected from the .blend file.
+settings.engine = 'CYCLES'
+scene.cycles.samples = 64
+scene.cycles.use_denoising = True
 
 # --- Tiling with Render Border ---
 settings.resolution_x = {}
@@ -101,8 +79,6 @@ tile_y = tile_index // tile_count_x
 
 render_settings = bpy.context.scene.render
 render_settings.use_border = True
-
-# THIS IS THE FIX: Use the correct property name for Blender 4.1+
 render_settings.use_crop_to_border = True
 
 border_min_x = tile_x / tile_count_x
