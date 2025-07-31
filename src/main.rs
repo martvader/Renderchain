@@ -11,7 +11,7 @@ mod job_pool;
 
 use crate::cli::{Cli, Commands};
 use crate::core::blockchain::Blockchain;
-use crate::consensus::pow::{ProofOfWork, PowError}; // Added PowError
+use crate::consensus::pow::{ProofOfWork, PowError};
 use crate::core::block::Block;
 use crate::core::transaction::{Transaction, TXInput, TXOutput};
 use crate::wallets::Wallets;
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
         Commands::Status { rpc_connect } => show_blockchain_status(rpc_connect).await,
         Commands::GetBalance { address, rpc_connect } => get_balance(address, rpc_connect).await,
         Commands::SubmitJob { scene_file } => {
-            let rpc_connect = "127.0.0.1:9001".to_string(); // Use your default RPC port
+            let rpc_connect = "127.0.0.1:9001".to_string();
             submit_job(scene_file, rpc_connect).await
         },
         Commands::AssembleJob { job_id, output } => assemble_job(job_id, output).await,
@@ -51,7 +51,6 @@ async fn main() -> Result<()> {
     }
 }
 
-// FIX: This function is now corrected to be a passive worker.
 async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
     log::info!("Starting RenderChain node...");
     let wallets = Wallets::load_from_file("wallets.json")?;
@@ -63,7 +62,6 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
     let listener = TcpListener::bind(&rpc_bind).await?;
     log::info!("RPC server listening on {}", rpc_bind);
     
-    // --- RPC Server Thread ---
     let bc_for_rpc = blockchain.clone();
     let mempool_for_rpc = mempool.clone();
     let job_pool_for_rpc = job_pool.clone();
@@ -87,7 +85,6 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
         }
     });
     
-    // --- Initial Node Info ---
     {
         let bc = blockchain.lock().unwrap();
         log::info!("Blockchain initialized with height: {}", bc.height);
@@ -96,28 +93,23 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
     }
     log::info!("Starting mining loop... Waiting for jobs to be submitted.");
     
-    // --- Main Mining Loop ---
     loop {
-        // Step 1: Check if there are any jobs in the pool.
         let has_jobs = {
             let job_pool_guard = job_pool.lock().unwrap();
             !job_pool_guard.is_empty()
         };
 
-        // If no jobs, wait and continue the loop.
         if !has_jobs {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            continue; // Go back to the start of the loop to check again.
+            continue;
         }
 
-        // If we reach here, there are jobs to be done.
         log::info!("Jobs available. Starting new mining round...");
         
         let miner_address_str = miner_wallet.get_address(Network::Mainnet);
         let decoded_address = bs58::decode(&miner_address_str).into_vec()?;
         let miner_pub_key_hash = decoded_address[1..decoded_address.len() - 4].to_vec();
         
-        // Step 2: Create a new block candidate to hold the transaction and proofs.
         let new_block_candidate = {
             let bc = blockchain.lock().unwrap();
             let coinbase_tx = Transaction::new_coinbase_tx(&miner_pub_key_hash, format!("Block #{} reward", bc.height + 1));
@@ -130,10 +122,8 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
             Block::new(1, transactions.clone(), bc.tip.clone())?
         };
         
-        // Step 3: The miner no longer creates its own jobs. It just processes what's in the pool.
         let mut pow = ProofOfWork::new(new_block_candidate);
         
-        // The `run` method will now pull one job from the shared `job_pool`.
         match pow.run(job_pool.clone()) {
             Ok((certificates, winning_nonce)) => {
                 let mut finalized_block = pow.into_block();
@@ -150,8 +140,6 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
                     );
                 }
             }
-            // This error is expected and normal. It just means the job was taken by another process
-            // or the pool became empty while we were setting up. The loop will simply restart.
             Err(PowError::AbortedForNewJob) => {
                 log::info!("Mining round aborted, job likely completed or pool is empty. Checking again...");
             }
@@ -159,11 +147,9 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
                 log::error!("❌ Mining failed: {}", e);
             },
         }
-        // Small delay to prevent a tight loop on continuous errors.
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
-
 
 fn create_unsigned_transaction(from: &str, to: &str, amount: u64, bc: &Blockchain) -> Result<Transaction> {
     let from_pub_key_hash = bs58::decode(from).into_vec()?[1..21].to_vec();
@@ -185,69 +171,92 @@ fn create_unsigned_transaction(from: &str, to: &str, amount: u64, bc: &Blockchai
 }
 
 async fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempool_arc: Arc<Mutex<Mempool>>, job_pool_arc: Arc<Mutex<JobPool>>) -> String {
-    let parts: Vec<&str> = request.trim().split_whitespace().collect();
+    // THIS IS THE FIX: Use `splitn` to correctly handle paths with spaces.
+    let parts: Vec<&str> = request.trim().splitn(2, ' ').collect();
+    
     match parts.as_slice() {
-        ["get_balance", addr] => {
+        // The patterns now need to be adjusted slightly to handle the output of `splitn`
+        ["get_balance", args] => {
+            let addr = args.trim();
             if let Ok(decoded) = bs58::decode(addr).into_vec() {
                 if decoded.len() > 4 {
                     let pkh = &decoded[1..decoded.len() - 4];
                     format!("OK balance {}", bc_arc.lock().unwrap().get_balance(pkh))
-                } else { "ERR InvalidAddressLength".to_string() }
-            } else { "ERR InvalidAddressFormat".to_string() }
+                } else {
+                    format!("ERR InvalidAddressLength: Address '{}' is too short.", addr)
+                }
+            } else {
+                format!("ERR InvalidAddressFormat: Could not decode address '{}'.", addr)
+            }
         }
         ["get_status"] => {
             let bc = bc_arc.lock().unwrap();
             format!("OK status height={} tip={}", bc.height, hex::encode(&bc.tip))
         }
-        ["create_unsigned_tx", from, to, amount_str] => {
-            match amount_str.parse::<u64>() {
-                Ok(amount) => {
-                    let bc = bc_arc.lock().unwrap();
-                    match create_unsigned_transaction(from, to, amount, &bc) {
-                        Ok(tx) => format!("OK unsigned_tx {}", hex::encode(bincode::serialize(&tx).unwrap())),
-                        Err(e) => format!("ERR {}", e.to_string()),
+        ["create_unsigned_tx", args] => {
+            let sub_parts: Vec<&str> = args.split_whitespace().collect();
+            if let [from, to, amount_str] = sub_parts.as_slice() {
+                match amount_str.parse::<u64>() {
+                    Ok(amount) => {
+                        let bc = bc_arc.lock().unwrap();
+                        match create_unsigned_transaction(from, to, amount, &bc) {
+                            Ok(tx) => format!("OK unsigned_tx {}", hex::encode(bincode::serialize(&tx).unwrap())),
+                            Err(e) => format!("ERR CreateTxFailed: {}", e),
+                        }
                     }
+                    Err(_) => format!("ERR InvalidAmount: Could not parse '{}' as a number.", amount_str),
                 }
-                Err(_) => "ERR InvalidAmount".to_string(),
+            } else {
+                format!("ERR InvalidArgs: Expected 'from to amount', got '{}'", args)
             }
         }
         ["submit_tx", tx_hex] => {
-            if let Ok(tx_bytes) = hex::decode(tx_hex) {
-                if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
-                    let txid = tx.id.clone();
-                    mempool_arc.lock().unwrap().add_transaction(tx);
-                    format!("OK tx_submitted {}", hex::encode(&txid))
-                } else { "ERR InvalidTransactionData".to_string() }
-            } else { "ERR InvalidHex".to_string() }
+            match hex::decode(tx_hex.trim()) {
+                Ok(tx_bytes) => {
+                    match bincode::deserialize::<Transaction>(&tx_bytes) {
+                        Ok(tx) => {
+                            let txid = tx.id.clone();
+                            mempool_arc.lock().unwrap().add_transaction(tx);
+                            format!("OK tx_submitted {}", hex::encode(&txid))
+                        },
+                        Err(e) => format!("ERR InvalidTransactionData: Could not deserialize. Bincode error: {}", e)
+                    }
+                },
+                Err(_) => format!("ERR InvalidHex: Could not decode hex string.")
+            }
         }
         ["submit_job", scene_file] => {
-            let absolute_scene_file = match std::fs::canonicalize(scene_file) {
-                Ok(path) => path.to_string_lossy().into_owned(),
-                Err(e) => return format!("ERR Cannot find scene file: {}", e),
-            };
+            match std::fs::canonicalize(scene_file.trim()) {
+                Ok(path) => {
+                    let absolute_scene_file = path.to_string_lossy().into_owned();
+                    let job_id = format!("job_{}", chrono::Utc::now().timestamp_micros());
+                    log::info!("New render job received: {}. Queuing tiles for {}...", &job_id, &absolute_scene_file);
 
-            const TOTAL_TILES: u32 = 16; 
-            let job_id = format!("job_{}", chrono::Utc::now().timestamp_micros());
-            log::info!("New render job received: {}. Queuing {} tiles for {}...", &job_id, TOTAL_TILES, &absolute_scene_file);
-            
-            let work_units: Vec<WorkUnit> = (0..TOTAL_TILES).map(|i| {
-                WorkUnit {
-                    task_id: job_id.clone(),
-                    tile_index: i,
-                    scene_file: absolute_scene_file.clone(),
-                    render_settings: "{}".to_string(),
+                    const TOTAL_TILES: u32 = 16; 
+                    let work_units: Vec<WorkUnit> = (0..TOTAL_TILES).map(|i| {
+                        WorkUnit {
+                            task_id: job_id.clone(),
+                            tile_index: i,
+                            scene_file: absolute_scene_file.clone(),
+                            render_settings: "{}".to_string(),
+                        }
+                    }).collect();
+                    
+                    let mut job_pool_guard = job_pool_arc.lock().unwrap();
+                    job_pool_guard.add_jobs(work_units);
+                    
+                    log::info!("All {} tiles for job {} have been queued.", TOTAL_TILES, &job_id);
+                    format!("OK job_submitted {}", job_id)
+                },
+                Err(e) => {
+                    format!("ERR SceneFileNotFound: Could not find '{}'. OS error: {}", scene_file.trim(), e)
                 }
-            }).collect();
-            
-            let mut job_pool_guard = job_pool_arc.lock().unwrap();
-            job_pool_guard.add_jobs(work_units);
-            
-            log::info!("All {} tiles for job {} have been queued.", TOTAL_TILES, &job_id);
-            format!("OK job_submitted {}", job_id)
+            }
         }
-        _ => "ERR InvalidCommand".to_string(),
+        _ => format!("ERR InvalidCommand: Received '{}'", request.trim()),
     }
 }
+
 
 fn create_wallet(output: String) -> Result<()> {
     let mut wallets = Wallets::load_from_file(&output)?;
@@ -264,12 +273,11 @@ async fn show_blockchain_status(rpc_connect: String) -> Result<()> {
     let mut buffer = [0; 1024];
     let n = stream.read(&mut buffer).await?;
     let response = String::from_utf8_lossy(&buffer[..n]);
-    let parts: Vec<&str> = response.trim().split_whitespace().collect();
-    if let ["OK", "status", height_part, tip_part] = parts.as_slice() {
-        println!("Blockchain Status:");
-        println!("  {}", height_part);
-        println!("  {}", tip_part);
-    } else { log::error!("Failed to get status from node: {}", response); }
+    if !response.starts_with("OK") {
+        log::error!("Failed to get status from node: {}", response);
+    } else {
+        println!("Blockchain Status:\n{}", response);
+    }
     Ok(())
 }
 
@@ -280,10 +288,12 @@ async fn get_balance(address: String, rpc_connect: String) -> Result<()> {
     let mut buffer = [0; 1024];
     let n = stream.read(&mut buffer).await?;
     let response = String::from_utf8_lossy(&buffer[..n]);
-    let parts: Vec<&str> = response.trim().split_whitespace().collect();
-    if let ["OK", "balance", balance_str] = parts.as_slice() {
-        println!("Balance for address {}: {} FOLD", address, balance_str);
-    } else { log::error!("Failed to get balance from node: {}", response); }
+    if response.starts_with("OK") {
+        let parts: Vec<&str> = response.split_whitespace().collect();
+        println!("Balance for address {}: {} FOLD", address, parts[2]);
+    } else {
+        log::error!("Failed to get balance from node: {}", response);
+    }
     Ok(())
 }
 
@@ -295,11 +305,13 @@ async fn submit_job(scene_file: String, rpc_connect: String) -> Result<()> {
     let mut buffer = [0; 1024];
     let n = stream.read(&mut buffer).await?;
     let response = String::from_utf8_lossy(&buffer[..n]);
-    let parts: Vec<&str> = response.trim().split_whitespace().collect();
-    if let ["OK", "job_submitted", job_id] = parts.as_slice() {
+    if response.starts_with("OK") {
+        let parts: Vec<&str> = response.split_whitespace().collect();
         println!("Success! Job submitted to the node.");
-        println!("JOB_ID: {}", job_id);
-    } else { log::error!("Failed to submit job: {}", response); }
+        println!("JOB_ID: {}", parts[2]);
+    } else {
+        log::error!("Failed to submit job: {}", response);
+    }
     Ok(())
 }
 
@@ -311,10 +323,10 @@ async fn send_transaction(from: String, to: String, amount: u64, wallet_file: St
     let mut buffer = [0; 8192];
     let n = stream.read(&mut buffer).await?;
     let response = String::from_utf8_lossy(&buffer[..n]);
-    let parts: Vec<&str> = response.trim().split_whitespace().collect();
+    let parts: Vec<&str> = response.split_whitespace().collect();
     let unsigned_tx_hex = match parts.as_slice() {
         ["OK", "unsigned_tx", hex_str] => *hex_str,
-        ["ERR", err_msg] => return Err(anyhow!("Node returned an error: {}", err_msg)),
+        ["ERR", ..] => return Err(anyhow!("Node returned an error: {}", response)),
         _ => return Err(anyhow!("Invalid response from node: {}", response)),
     };
     let tx_bytes = hex::decode(unsigned_tx_hex)?;

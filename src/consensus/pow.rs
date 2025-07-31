@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use which::which;
 use image::{ImageBuffer, imageops};
-use std::path::Path; // FIX: Removed unused PathBuf
+use std::path::Path;
 
 pub const NUM_ORACLES: usize = 5;
 pub const REQUIRED_SIGNATURES: usize = 3;
@@ -25,12 +25,8 @@ const TOTAL_HEIGHT: u32 = 768;
 
 pub struct RenderEngine;
 
-// ... rest of pow.rs remains the same as your last working version ...
-// The only change was removing PathBuf from the `use` statement.
-
 impl RenderEngine {
     pub fn run(work_unit: &WorkUnit, nonce: u32, unique_id: &str) -> Result<Vec<u8>> {
-        // Handle both relative and absolute paths
         let scene_path = Path::new(&work_unit.scene_file);
         let abs_scene_path = if scene_path.is_relative() {
             std::env::current_dir()?.join(scene_path)
@@ -39,11 +35,7 @@ impl RenderEngine {
         };
         
         if !abs_scene_path.exists() {
-            return Err(anyhow!(
-                "Scene file not found: {}\nAbsolute path: {}", 
-                work_unit.scene_file,
-                abs_scene_path.display()
-            ));
+            return Err(anyhow!("Scene file not found: {}", scene_path.display()));
         }
         
         let mut path_str = abs_scene_path.to_string_lossy().into_owned();
@@ -69,12 +61,11 @@ from mathutils import Vector
 
 bpy.ops.wm.open_mainfile(filepath="{}")
 
-# --- DEFINITIVE FIX PART 1: Intelligent Auto-Framing ---
+# --- Auto-Framing Camera ---
 scene = bpy.context.scene
 camera = scene.camera
 settings = scene.render
 
-# 1. Calculate the bounding box of all visible mesh objects to find the scene's center and size.
 min_vec, max_vec = Vector((float('inf'),)*3), Vector((float('-inf'),)*3)
 has_visible_objects = False
 for obj in bpy.context.visible_objects:
@@ -88,37 +79,41 @@ center = (min_vec + max_vec) / 2.0 if has_visible_objects else Vector((0.0, 0.0,
 bbox_size = max_vec - min_vec
 size = max(bbox_size.x, bbox_size.y) if has_visible_objects else 5.0
 
-# 2. Position and aim the camera based on the calculated center and size.
 if camera:
     fov = camera.data.angle
-    # This is the "zoom" calculation. It finds the perfect distance.
     distance = (size / 2.0) / math.tan(fov / 2.0)
     direction_vector = Vector((1.5, -1.0, 0.15)).normalized()
-    # Position the camera at the calculated distance, not a hard-coded one.
-    # A smaller padding factor (e.g., 1.5) brings the camera closer.
     camera.location = center + direction_vector * distance * 1.0
-    
     direction = center - camera.location
     rot_quat = direction.to_track_quat('-Z', 'Y')
     camera.rotation_euler = rot_quat.to_euler()
-    
     camera.data.clip_start = 0.1
     camera.data.clip_end = distance * 5.0
 
-# --- DEFINITIVE FIX PART 2: Use Your Working Camera Shift Tiling ---
-tile_count_x, tile_count_y, tile_index = {}, {}, {}
-tile_x, tile_y = tile_index % tile_count_x, tile_index // tile_count_y
-
-settings.resolution_x = {} // tile_count_x
-settings.resolution_y = {} // tile_count_y
+# --- Tiling with Render Border ---
+settings.resolution_x = {}
+settings.resolution_y = {}
 settings.resolution_percentage = 100
 
-# Use the correct divisor of 2.0 for standard tiling. Your 3.5/3.0 was a clever
-# hack to compensate for the distant camera, which we have now fixed.
-camera.data.shift_x = (tile_x - (tile_count_x - 0.5) / 3.0)
-camera.data.shift_y = ((tile_count_y - 0.5) / 3.0) - tile_y
+tile_count_x, tile_count_y, tile_index = {}, {}, {}
+tile_x = tile_index % tile_count_x
+tile_y = tile_index // tile_count_x
 
-settings.use_border = False
+render_settings = bpy.context.scene.render
+render_settings.use_border = True
+
+# THIS IS THE FIX: Use the correct property name for Blender 4.1+
+render_settings.use_crop_to_border = True
+
+border_min_x = tile_x / tile_count_x
+border_max_x = (tile_x + 1) / tile_count_x
+border_min_y = 1.0 - (tile_y + 1) / tile_count_y
+border_max_y = 1.0 - tile_y / tile_count_y
+
+render_settings.border_min_x = border_min_x
+render_settings.border_max_x = border_max_x
+render_settings.border_min_y = border_min_y
+render_settings.border_max_y = border_max_y
 
 # --- Final Render Settings ---
 bpy.context.scene.cycles.seed = {}
@@ -127,8 +122,8 @@ settings.image_settings.file_format = 'PNG'
 bpy.ops.render.render(write_still=True)
 "#, 
             python_safe_scene_path,
-            TILE_COUNT_X, TILE_COUNT_Y, work_unit.tile_index,
             TOTAL_WIDTH, TOTAL_HEIGHT,
+            TILE_COUNT_X, TILE_COUNT_Y, work_unit.tile_index,
             nonce, 
             python_safe_temp_path
         );
@@ -142,16 +137,23 @@ bpy.ops.render.render(write_still=True)
             .output()
             .with_context(|| format!("Failed to execute Blender at '{}'", blender_executable))?;
         
+        if !temp_output_path.exists() {
+            let stdout = String::from_utf8_lossy(&cmd_output.stdout);
+            let stderr = String::from_utf8_lossy(&cmd_output.stderr);
+            return Err(anyhow!(
+                "Blender executed but failed to create the output file at '{}'. This usually indicates a Python script error.\n\nBlender STDOUT:\n{}\n\nBlender STDERR:\n{}",
+                temp_output_path.display(),
+                stdout,
+                stderr
+            ));
+        }
+
         if !cmd_output.status.success() {
             let stderr = String::from_utf8_lossy(&cmd_output.stderr);
             let stdout = String::from_utf8_lossy(&cmd_output.stdout);
-            return Err(anyhow!("Blender process failed:\nSTDOUT:\n{}\nSTDERR:\n{}", stdout, stderr));
+            return Err(anyhow!("Blender process failed with a non-zero exit code:\nSTDOUT:\n{}\nSTDERR:\n{}", stdout, stderr));
         }
         
-        if !temp_output_path.exists() {
-            return Err(anyhow!("Rendered temp image not found at '{}'", temp_output_path.display()));
-        }
-
         fs::rename(&temp_output_path, &final_output_path)
             .with_context(|| format!("Failed to rename temp file from {} to {}", temp_output_path.display(), final_output_path.display()))?;
 
@@ -159,7 +161,6 @@ bpy.ops.render.render(write_still=True)
         Ok(image_bytes)
     }
 
-    // --- DEFINITIVE FIX PART 3: Correct Assembly Logic for Camera Shift ---
     pub fn assemble_final_image(job_id: &str, output_path: &Path) -> Result<()> {
         let output_dir = std::env::current_dir()?.join("render_output");
         let tile_width = TOTAL_WIDTH / TILE_COUNT_X as u32;
@@ -180,8 +181,6 @@ bpy.ops.render.render(write_still=True)
                     let tile_x = tile_index % TILE_COUNT_X as u32;
                     let tile_y = tile_index / TILE_COUNT_X as u32;
                     
-                    // CORRECTED: With camera shift, the tiles are rendered top-to-bottom.
-                    // We assemble them directly without flipping the Y-axis.
                     let pos_x = tile_x * tile_width;
                     let pos_y = tile_y * tile_height;
                     
