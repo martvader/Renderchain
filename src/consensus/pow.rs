@@ -53,6 +53,10 @@ impl RenderEngine {
         let temp_output_path = output_dir.join(temp_output_filename);
         let python_safe_temp_path = temp_output_path.to_string_lossy().replace('\\', "/");
         
+        // Calculate a consistent seed based on the job's task_id.
+        // The type annotation `: u32` is added here to resolve the compiler error.
+        let job_seed: u32 = work_unit.task_id.chars().map(|c| c as u32).sum();
+
         let python_script = format!(r#"
 import bpy
 
@@ -62,8 +66,6 @@ scene = bpy.context.scene
 settings = scene.render
 
 # --- RENDER SETTINGS ---
-# We explicitly set the engine and a reasonable sample count to ensure consistency.
-# The camera position, lighting, and materials are now entirely respected from the .blend file.
 settings.engine = 'CYCLES'
 scene.cycles.samples = 64
 scene.cycles.use_denoising = True
@@ -100,7 +102,7 @@ bpy.ops.render.render(write_still=True)
             python_safe_scene_path,
             TOTAL_WIDTH, TOTAL_HEIGHT,
             TILE_COUNT_X, TILE_COUNT_Y, work_unit.tile_index,
-            nonce, 
+            job_seed,
             python_safe_temp_path
         );
         
