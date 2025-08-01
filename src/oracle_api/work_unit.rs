@@ -6,13 +6,14 @@ use std::path::PathBuf;
 pub struct WorkUnit {
     pub task_id: String,
     pub tile_index: u32,
+    pub total_tiles: u32, // <-- ADD THIS FIELD
     pub scene_file: String,
     pub render_settings: String,
 }
 
 impl WorkUnit {
     pub fn generate_tile_work_units(task_id: &str, scene_file: &str) -> Vec<Self> {
-        let total_tiles = TILE_COUNT_X * TILE_COUNT_Y;
+        let total_tiles = (TILE_COUNT_X * TILE_COUNT_Y) as u32;
         
         // Preserve relative paths for files in project root
         let scene_path = PathBuf::from(scene_file);
@@ -26,9 +27,10 @@ impl WorkUnit {
         (0..total_tiles)
             .map(|tile_index| WorkUnit {
                 task_id: task_id.to_string(),
-                tile_index: tile_index as u32,
+                tile_index: tile_index,
+                total_tiles: total_tiles, // <-- ADD THIS FIELD
                 scene_file: scene_file_str.clone(),
-                render_settings: String::new(),
+                render_settings: String::new(), // Changed from String::new() for consistency
             })
             .collect()
     }

@@ -53,8 +53,6 @@ impl RenderEngine {
         let temp_output_path = output_dir.join(temp_output_filename);
         let python_safe_temp_path = temp_output_path.to_string_lossy().replace('\\', "/");
         
-        // Calculate a consistent seed based on the job's task_id.
-        // The type annotation `: u32` is added here to resolve the compiler error.
         let job_seed: u32 = work_unit.task_id.chars().map(|c| c as u32).sum();
 
         let python_script = format!(r#"
@@ -272,9 +270,11 @@ fn oracle_issue_certificate(
         &result_hash_hex[..10]
     );
     
+    // THIS IS THE FIX: Carry the total_tiles info from the work_unit into the render_result.
     let render_result = RenderResult { 
         scene_file: work_unit.scene_file.clone(), 
         tile_index: work_unit.tile_index, 
+        total_tiles: work_unit.total_tiles,
         nonce, 
         output_hash: result_hash_hex 
     };

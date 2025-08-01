@@ -127,7 +127,7 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
         match pow.run(job_pool.clone()) {
             Ok((certificates, winning_nonce)) => {
                 let mut finalized_block = pow.into_block();
-                finalized_block.finalize(certificates, winning_nonce)?;
+                finalized_block.finalize(certificates.clone(), winning_nonce)?;
                 
                 let mut bc_lock = blockchain.lock().unwrap();
                 if let Err(e) = bc_lock.add_block(finalized_block.clone()) {
@@ -138,6 +138,26 @@ async fn run_miner(wallet_address: String, rpc_bind: String) -> Result<()> {
                         finalized_block.proofs.len(), 
                         hex::encode(&bc_lock.tip)
                     );
+
+                    // =================== NEW IPFS LOGIC STARTS HERE ===================
+                    // Check if the mined tile was the last one for a job.
+                    if let Some(cert) = certificates.first() {
+                        let result = &cert.simulation_result;
+                        
+                        // The job is complete if the tile index is one less than the total.
+                        if result.tile_index == result.total_tiles - 1 {
+                            log::info!("🎉 Final tile for job '{}' mined. Beginning assembly and upload.", cert.task_id);
+                            
+                            // Spawn a new async task for assembly so it doesn't block the main mining loop.
+                            let job_id_clone = cert.task_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = assemble_and_publish_result(&job_id_clone).await {
+                                    log::error!("[Assembler] Failed to publish result for job {}: {}", job_id_clone, e);
+                                }
+                            });
+                        }
+                    }
+                    // =================== NEW IPFS LOGIC ENDS HERE ===================
                 }
             }
             Err(PowError::AbortedForNewJob) => {
@@ -171,11 +191,9 @@ fn create_unsigned_transaction(from: &str, to: &str, amount: u64, bc: &Blockchai
 }
 
 async fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempool_arc: Arc<Mutex<Mempool>>, job_pool_arc: Arc<Mutex<JobPool>>) -> String {
-    // THIS IS THE FIX: Use `splitn` to correctly handle paths with spaces.
     let parts: Vec<&str> = request.trim().splitn(2, ' ').collect();
     
     match parts.as_slice() {
-        // The patterns now need to be adjusted slightly to handle the output of `splitn`
         ["get_balance", args] => {
             let addr = args.trim();
             if let Ok(decoded) = bs58::decode(addr).into_vec() {
@@ -228,24 +246,17 @@ async fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempo
         ["submit_job", scene_file] => {
             match std::fs::canonicalize(scene_file.trim()) {
                 Ok(path) => {
-                    let absolute_scene_file = path.to_string_lossy().into_owned();
+                    let absolute_scene_file = path.to_string_lossy();
                     let job_id = format!("job_{}", chrono::Utc::now().timestamp_micros());
                     log::info!("New render job received: {}. Queuing tiles for {}...", &job_id, &absolute_scene_file);
 
-                    const TOTAL_TILES: u32 = 16; 
-                    let work_units: Vec<WorkUnit> = (0..TOTAL_TILES).map(|i| {
-                        WorkUnit {
-                            task_id: job_id.clone(),
-                            tile_index: i,
-                            scene_file: absolute_scene_file.clone(),
-                            render_settings: "{}".to_string(),
-                        }
-                    }).collect();
+                    let work_units = WorkUnit::generate_tile_work_units(&job_id, &absolute_scene_file);
+                    let total_tiles = work_units.len();
                     
                     let mut job_pool_guard = job_pool_arc.lock().unwrap();
                     job_pool_guard.add_jobs(work_units);
                     
-                    log::info!("All {} tiles for job {} have been queued.", TOTAL_TILES, &job_id);
+                    log::info!("All {} tiles for job {} have been queued.", total_tiles, &job_id);
                     format!("OK job_submitted {}", job_id)
                 },
                 Err(e) => {
@@ -257,6 +268,39 @@ async fn handle_rpc_request(request: &str, bc_arc: Arc<Mutex<Blockchain>>, mempo
     }
 }
 
+// =================== NEW IPFS HELPER FUNCTION ===================
+async fn assemble_and_publish_result(job_id: &str) -> Result<()> {
+    // 1. Assemble the final image
+    log::info!("[Assembler] Assembling final image for job '{}'...", job_id);
+    let output_path_str = format!("./render_output/{}_final.png", job_id);
+    let output_path = PathBuf::from(&output_path_str);
+    
+    consensus::pow::RenderEngine::assemble_final_image(job_id, &output_path)
+        .context("Failed to assemble final image")?;
+    log::info!("[Assembler] Image assembled at '{}'", output_path.display());
+
+    // 2. Add the final image to IPFS using the command line
+    log::info!("[Assembler] Adding final image to IPFS...");
+    let ipfs_output = tokio::process::Command::new("ipfs")
+        .arg("add")
+        .arg("--quieter")
+        .arg(&output_path)
+        .output()
+        .await
+        .context("Failed to execute IPFS command. Is the IPFS daemon running?")?;
+
+    if !ipfs_output.status.success() {
+        return Err(anyhow!("IPFS command failed: {}", String::from_utf8_lossy(&ipfs_output.stderr)));
+    }
+
+    let ipfs_cid = String::from_utf8(ipfs_output.stdout)?.trim().to_string();
+    log::info!("🎉🎉🎉 Job '{}' is complete and available on IPFS! 🎉🎉🎉", job_id);
+    log::info!("IPFS Content ID (CID): {}", ipfs_cid);
+    log::info!("Public Gateway URL: https://ipfs.io/ipfs/{}", ipfs_cid);
+    log::info!("(Note: Public gateways can be slow. Use `ipfs get {}` for a faster download if you have IPFS installed.)", ipfs_cid);
+
+    Ok(())
+}
 
 fn create_wallet(output: String) -> Result<()> {
     let mut wallets = Wallets::load_from_file(&output)?;
